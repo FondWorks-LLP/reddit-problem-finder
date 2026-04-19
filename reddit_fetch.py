@@ -2,97 +2,155 @@ import requests
 import time
 import random
 import re
-from urllib.parse import urlencode
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
 def _get_headers():
     return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
     }
 
 
 def fetch_reddit_posts(keyword: str, limit: int = 100) -> list[dict]:
+    """
+    Fetch Reddit posts via RSS feed — no API key, no bot blocking.
+    RSS is always open on Reddit regardless of server IP.
+    """
     posts = []
-    reddit_urls = _duckduckgo_search_reddit(keyword, num_results=20)
 
-    if not reddit_urls:
-        return []
-
-    for permalink in reddit_urls[:20]:
-        thread_posts = _fetch_thread(permalink)
-        posts.extend(thread_posts)
-        time.sleep(0.6)
-        if len(posts) >= limit:
-            break
-
-    return posts[:limit]
-
-
-def _duckduckgo_search_reddit(keyword: str, num_results: int = 20) -> list[str]:
-    """Search DuckDuckGo for Reddit threads — pure regex, no extra dependencies."""
-    permalinks = []
-
-    queries = [
-        f"site:reddit.com {keyword} problem",
-        f"site:reddit.com {keyword} frustrated annoying",
-        f"site:reddit.com {keyword} hate difficult",
+    # Multiple RSS feeds to maximize results
+    feeds = [
+        f"https://www.reddit.com/search.rss?q={quote(keyword)}&sort=relevance&t=year&limit=50",
+        f"https://www.reddit.com/search.rss?q={quote(keyword)}+problem&sort=new&limit=50",
+        f"https://www.reddit.com/search.rss?q={quote(keyword)}+frustrated&sort=relevance&limit=50",
     ]
 
-    for query in queries:
-        try:
-            url = "https://html.duckduckgo.com/html/"
-            data = {"q": query, "kl": "us-en"}
+    permalinks_seen = set()
 
-            resp = requests.post(
-                url,
-                data=data,
-                headers=_get_headers(),
-                timeout=15
-            )
+    for feed_url in feeds:
+        try:
+            resp = requests.get(feed_url, headers=_get_headers(), timeout=15)
+            print(f"[rss] {feed_url[:80]} → status {resp.status_code}")
 
             if resp.status_code != 200:
-                print(f"[ddg] Status {resp.status_code}")
                 time.sleep(1)
                 continue
 
-            # Extract Reddit URLs using regex only — no BeautifulSoup needed
-            found = re.findall(
-                r'reddit\.com(/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+(?:/[^"&\s<>?#/]*)?)',
-                resp.text
-            )
+            # Parse RSS XML
+            items = _parse_rss(resp.text)
+            print(f"[rss] Parsed {len(items)} items")
 
-            for path in found:
-                clean = "/" + path.strip("/")
-                if clean not in permalinks:
-                    permalinks.append(clean)
+            for item in items:
+                permalink = item.get("permalink", "")
+                if not permalink or permalink in permalinks_seen:
+                    continue
+                permalinks_seen.add(permalink)
 
-            print(f"[ddg] Query '{query}' found {len(found)} URLs")
-            time.sleep(1.5)
+                # Add the post text
+                text = item.get("text", "").strip()
+                if text and len(text) > 20:
+                    posts.append({
+                        "text": text,
+                        "source": "post",
+                        "subreddit": item.get("subreddit", ""),
+                        "url": item.get("url", "")
+                    })
 
-            if len(permalinks) >= num_results:
-                break
+                # Fetch comments for this thread
+                comments = _fetch_comments(permalink)
+                posts.extend(comments)
+                time.sleep(0.5)
+
+                if len(posts) >= limit:
+                    break
+
+            time.sleep(1)
 
         except Exception as e:
-            print(f"[ddg] Search failed: {e}")
+            print(f"[rss] Feed failed: {e}")
             continue
 
-    print(f"[ddg] Total Reddit URLs found: {len(permalinks)}")
-    return permalinks[:num_results]
+        if len(posts) >= limit:
+            break
+
+    print(f"[rss] Total posts collected: {len(posts)}")
+    return posts[:limit]
 
 
-def _fetch_thread(permalink: str) -> list[dict]:
-    """Fetch a Reddit thread's post + comments via JSON."""
+def _parse_rss(xml_text: str) -> list[dict]:
+    """Parse Reddit RSS XML and extract post data."""
+    items = []
+
+    try:
+        root = ET.fromstring(xml_text)
+
+        # Reddit RSS namespace
+        ns = {
+            "media": "http://search.yahoo.com/mrss/",
+        }
+
+        # Find all <entry> tags (Atom format) or <item> tags (RSS format)
+        entries = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+        if not entries:
+            # Try standard RSS <item>
+            entries = root.findall(".//item")
+
+        for entry in entries:
+            try:
+                # Atom format
+                title_el = entry.find("{http://www.w3.org/2005/Atom}title")
+                link_el = entry.find("{http://www.w3.org/2005/Atom}link")
+                content_el = entry.find("{http://www.w3.org/2005/Atom}content")
+                category_el = entry.find("{http://www.w3.org/2005/Atom}category")
+
+                title = title_el.text if title_el is not None else ""
+                url = link_el.get("href", "") if link_el is not None else ""
+                content_raw = content_el.text if content_el is not None else ""
+                subreddit = category_el.get("term", "") if category_el is not None else ""
+
+                # Extract permalink from URL
+                permalink_match = re.search(r'reddit\.com(/r/[^"&\s?#]+)', url)
+                permalink = permalink_match.group(1) if permalink_match else ""
+
+                # Strip HTML tags from content
+                content_clean = re.sub(r"<[^>]+>", " ", content_raw or "")
+                content_clean = re.sub(r"\s+", " ", content_clean).strip()
+
+                # Combine title + content
+                text = f"{title}. {content_clean}".strip() if content_clean else title
+
+                if title or text:
+                    items.append({
+                        "text": text[:600],
+                        "permalink": permalink,
+                        "url": url,
+                        "subreddit": subreddit
+                    })
+
+            except Exception:
+                continue
+
+    except ET.ParseError as e:
+        print(f"[rss] XML parse error: {e}")
+
+    return items
+
+
+def _fetch_comments(permalink: str) -> list[dict]:
+    """Fetch top comments from a Reddit thread JSON."""
     results = []
-    url = f"https://www.reddit.com{permalink}.json?limit=10&sort=top"
+    if not permalink:
+        return results
+
+    url = f"https://www.reddit.com{permalink}.json?limit=8&sort=top"
 
     try:
         resp = requests.get(
@@ -105,53 +163,30 @@ def _fetch_thread(permalink: str) -> list[dict]:
         )
 
         if resp.status_code != 200:
-            print(f"[fetch_thread] Status {resp.status_code} for {permalink}")
             return results
 
         data = resp.json()
-
-        if not data or len(data) < 1:
+        if len(data) < 2:
             return results
 
-        # Post itself
+        subreddit = ""
         try:
-            post_data = data[0]["data"]["children"][0]["data"]
-            title = post_data.get("title", "").strip()
-            selftext = post_data.get("selftext", "").strip()
-            subreddit = post_data.get("subreddit", "")
-            combined = f"{title}. {selftext}".strip().rstrip(".")
-            if combined and len(combined) > 20:
-                results.append({
-                    "text": combined,
-                    "source": "post",
-                    "subreddit": subreddit,
-                    "url": f"https://reddit.com{permalink}"
-                })
+            subreddit = data[0]["data"]["children"][0]["data"].get("subreddit", "")
         except Exception:
             pass
 
-        # Comments
-        if len(data) >= 2:
-            try:
-                comments = data[1]["data"]["children"]
-                subreddit = ""
-                try:
-                    subreddit = data[0]["data"]["children"][0]["data"].get("subreddit", "")
-                except Exception:
-                    pass
-                for c in comments[:8]:
-                    body = c.get("data", {}).get("body", "").strip()
-                    if body and body not in ("[deleted]", "[removed]") and len(body) > 20:
-                        results.append({
-                            "text": body,
-                            "source": "comment",
-                            "subreddit": subreddit,
-                            "url": f"https://reddit.com{permalink}"
-                        })
-            except Exception:
-                pass
+        comments = data[1]["data"]["children"]
+        for c in comments[:6]:
+            body = c.get("data", {}).get("body", "").strip()
+            if body and body not in ("[deleted]", "[removed]") and len(body) > 20:
+                results.append({
+                    "text": body,
+                    "source": "comment",
+                    "subreddit": subreddit,
+                    "url": f"https://reddit.com{permalink}"
+                })
 
     except Exception as e:
-        print(f"[fetch_thread] Failed for {permalink}: {e}")
+        print(f"[comments] Failed: {e}")
 
     return results
