@@ -2,8 +2,7 @@ import requests
 import time
 import random
 import re
-from urllib.parse import quote, urlencode
-from bs4 import BeautifulSoup
+from urllib.parse import urlencode
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -39,7 +38,7 @@ def fetch_reddit_posts(keyword: str, limit: int = 100) -> list[dict]:
 
 
 def _duckduckgo_search_reddit(keyword: str, num_results: int = 20) -> list[str]:
-    """Search DuckDuckGo for Reddit threads — no bot protection, works on all servers."""
+    """Search DuckDuckGo for Reddit threads — pure regex, no extra dependencies."""
     permalinks = []
 
     queries = [
@@ -65,21 +64,18 @@ def _duckduckgo_search_reddit(keyword: str, num_results: int = 20) -> list[str]:
                 time.sleep(1)
                 continue
 
-            soup = BeautifulSoup(resp.text, "html.parser")
+            # Extract Reddit URLs using regex only — no BeautifulSoup needed
+            found = re.findall(
+                r'reddit\.com(/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+(?:/[^"&\s<>?#/]*)?)',
+                resp.text
+            )
 
-            # Extract all links from DDG results
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"]
-                # Find Reddit comment/post URLs
-                match = re.search(
-                    r'reddit\.com(/r/[^"&\s<>?#]+/comments/[^"&\s<>?#/]+(?:/[^"&\s<>?#/]+)?)',
-                    href
-                )
-                if match:
-                    clean = match.group(1).rstrip("/")
-                    if clean not in permalinks:
-                        permalinks.append(clean)
+            for path in found:
+                clean = "/" + path.strip("/")
+                if clean not in permalinks:
+                    permalinks.append(clean)
 
+            print(f"[ddg] Query '{query}' found {len(found)} URLs")
             time.sleep(1.5)
 
             if len(permalinks) >= num_results:
@@ -89,7 +85,7 @@ def _duckduckgo_search_reddit(keyword: str, num_results: int = 20) -> list[str]:
             print(f"[ddg] Search failed: {e}")
             continue
 
-    print(f"[ddg] Found {len(permalinks)} Reddit URLs: {permalinks[:5]}")
+    print(f"[ddg] Total Reddit URLs found: {len(permalinks)}")
     return permalinks[:num_results]
 
 
@@ -109,6 +105,7 @@ def _fetch_thread(permalink: str) -> list[dict]:
         )
 
         if resp.status_code != 200:
+            print(f"[fetch_thread] Status {resp.status_code} for {permalink}")
             return results
 
         data = resp.json()
@@ -122,7 +119,6 @@ def _fetch_thread(permalink: str) -> list[dict]:
             title = post_data.get("title", "").strip()
             selftext = post_data.get("selftext", "").strip()
             subreddit = post_data.get("subreddit", "")
-
             combined = f"{title}. {selftext}".strip().rstrip(".")
             if combined and len(combined) > 20:
                 results.append({
@@ -143,7 +139,6 @@ def _fetch_thread(permalink: str) -> list[dict]:
                     subreddit = data[0]["data"]["children"][0]["data"].get("subreddit", "")
                 except Exception:
                     pass
-
                 for c in comments[:8]:
                     body = c.get("data", {}).get("body", "").strip()
                     if body and body not in ("[deleted]", "[removed]") and len(body) > 20:
