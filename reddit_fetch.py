@@ -3,6 +3,7 @@ import time
 import random
 import re
 from urllib.parse import quote, urlencode
+from bs4 import BeautifulSoup
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -17,95 +18,84 @@ def _get_headers():
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Referer": "https://www.google.com/",
     }
 
 
 def fetch_reddit_posts(keyword: str, limit: int = 100) -> list[dict]:
-    """
-    Fetch Reddit posts by searching Google for site:reddit.com results,
-    then fetching each Reddit thread's JSON directly.
-    No API key required. Works on cloud servers.
-    """
     posts = []
-
-    # Step 1: Get Reddit thread URLs via Google
-    reddit_urls = _google_search_reddit(keyword, num_results=20)
+    reddit_urls = _duckduckgo_search_reddit(keyword, num_results=20)
 
     if not reddit_urls:
         return []
 
-    # Step 2: Fetch each Reddit thread JSON
     for permalink in reddit_urls[:20]:
-        thread_posts = _fetch_thread(permalink, keyword)
+        thread_posts = _fetch_thread(permalink)
         posts.extend(thread_posts)
         time.sleep(0.6)
-
         if len(posts) >= limit:
             break
 
     return posts[:limit]
 
 
-def _google_search_reddit(keyword: str, num_results: int = 20) -> list[str]:
-    """
-    Search Google for Reddit threads about the keyword.
-    Returns list of Reddit permalinks.
-    """
+def _duckduckgo_search_reddit(keyword: str, num_results: int = 20) -> list[str]:
+    """Search DuckDuckGo for Reddit threads — no bot protection, works on all servers."""
     permalinks = []
 
     queries = [
         f"site:reddit.com {keyword} problem",
-        f"site:reddit.com {keyword} frustrated",
-        f"site:reddit.com {keyword} hate",
+        f"site:reddit.com {keyword} frustrated annoying",
+        f"site:reddit.com {keyword} hate difficult",
     ]
 
     for query in queries:
         try:
-            params = {
-                "q": query,
-                "num": 10,
-                "hl": "en",
-                "gl": "us",
-            }
-            url = f"https://www.google.com/search?{urlencode(params)}"
+            url = "https://html.duckduckgo.com/html/"
+            data = {"q": query, "kl": "us-en"}
 
-            resp = requests.get(url, headers=_get_headers(), timeout=15)
+            resp = requests.post(
+                url,
+                data=data,
+                headers=_get_headers(),
+                timeout=15
+            )
 
             if resp.status_code != 200:
+                print(f"[ddg] Status {resp.status_code}")
                 time.sleep(1)
                 continue
 
-            # Extract Reddit URLs from Google HTML
-            found = re.findall(
-                r'reddit\.com(/r/[^"&\s<>]+/comments/[^"&\s<>]+)',
-                resp.text
-            )
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-            for path in found:
-                # Clean up the path
-                clean = path.split("?")[0].rstrip("/")
-                if clean not in permalinks:
-                    permalinks.append(clean)
+            # Extract all links from DDG results
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+                # Find Reddit comment/post URLs
+                match = re.search(
+                    r'reddit\.com(/r/[^"&\s<>?#]+/comments/[^"&\s<>?#/]+(?:/[^"&\s<>?#/]+)?)',
+                    href
+                )
+                if match:
+                    clean = match.group(1).rstrip("/")
+                    if clean not in permalinks:
+                        permalinks.append(clean)
 
-            time.sleep(1.2)  # be polite to Google
+            time.sleep(1.5)
 
             if len(permalinks) >= num_results:
                 break
 
         except Exception as e:
-            print(f"[google_search] Failed: {e}")
+            print(f"[ddg] Search failed: {e}")
             continue
 
+    print(f"[ddg] Found {len(permalinks)} Reddit URLs: {permalinks[:5]}")
     return permalinks[:num_results]
 
 
-def _fetch_thread(permalink: str, keyword: str) -> list[dict]:
-    """
-    Fetch a single Reddit thread's post + comments via JSON.
-    """
+def _fetch_thread(permalink: str) -> list[dict]:
+    """Fetch a Reddit thread's post + comments via JSON."""
     results = []
-
     url = f"https://www.reddit.com{permalink}.json?limit=10&sort=top"
 
     try:
@@ -126,7 +116,7 @@ def _fetch_thread(permalink: str, keyword: str) -> list[dict]:
         if not data or len(data) < 1:
             return results
 
-        # ── Post itself ───────────────────────────────────────────────────────
+        # Post itself
         try:
             post_data = data[0]["data"]["children"][0]["data"]
             title = post_data.get("title", "").strip()
@@ -144,7 +134,7 @@ def _fetch_thread(permalink: str, keyword: str) -> list[dict]:
         except Exception:
             pass
 
-        # ── Comments ──────────────────────────────────────────────────────────
+        # Comments
         if len(data) >= 2:
             try:
                 comments = data[1]["data"]["children"]
